@@ -11,7 +11,7 @@ sees a normal Pro Controller.
 - Native pairing with the Switch 2, no console modification
 - Wakes the console from sleep
 - Full motion controls (gyro + accelerometer)
-- All buttons, both sticks, and analog triggers
+- All buttons, both sticks, and analog triggers, and paddles
 - Battery level reported to the console
 - Bluetooth only — no dongle, no receiver, no cables to the console
 
