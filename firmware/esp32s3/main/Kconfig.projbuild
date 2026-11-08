@@ -20,4 +20,26 @@ menu "Steam2Switch2 adapter"
             addresses in S2S_SC2_MAC. Use this once the controller's address is
             known, so no other Steam-named device can be picked up by mistake.
 
+    config S2S_WEB_ENABLE
+        bool "Enable the macro editor web UI (Wi-Fi access point)"
+        default y
+        help
+            Serves the macro editor from the adapter over its own Wi-Fi access
+            point. Wi-Fi and Bluetooth share the radio, so enabling this adds
+            coexistence traffic; disable it for the lowest possible input
+            latency when macros are not needed.
+
+    config S2S_WIFI_SSID
+        string "Access point name"
+        default "Puck2Switch2"
+        depends on S2S_WEB_ENABLE
+
+    config S2S_WIFI_PASSWORD
+        string "Access point password (empty = open network)"
+        default ""
+        depends on S2S_WEB_ENABLE
+        help
+            At least 8 characters enables WPA2. Leave empty for an open network,
+            which is the easiest to join from a phone or laptop.
+
 endmenu

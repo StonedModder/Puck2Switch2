@@ -26,9 +26,12 @@
 #include "switch2_pro.hpp"
 
 #include "ns2_motion30.h"
+#include "macro_engine.hpp"
+#include "macro_store.hpp"
 #include "sc2_central.hpp"
 #include "sc2_core.h"
 #include "sc2_map_espp.hpp"
+#include "web_server.hpp"
 
 static const char *TAG = "S2S";
 
@@ -40,8 +43,10 @@ static std::atomic<int64_t> g_in_ts_us{0}; // arrival time of the newest SC2 sam
 
 // --- report pipeline (NimBLE host task) -------------------------------------
 static espp::Switch2Pro *g_ctl = nullptr;
+static Sc2Central *g_sc2 = nullptr;
 static s2s::MapConfig g_cfg{};
 static std::atomic<bool> g_hold_lr{false}; // console is asking "press L + R"
+static MacroEngine g_macro;
 
 // Live IMU: fuse the SC2's gyro+accel into an orientation quaternion and emit
 // the Switch 2's hardware-validated 30-byte motion carrier (report 0x0E = 0x1E).
@@ -92,7 +97,34 @@ static void push_from_sc2(const s2s::Sc2Input &in, const s2s::Sc2Battery &bat) {
     }
   }
 
-  if (g_ctl) g_ctl->set_input_report(report);
+  if (g_macro.recording()) {
+    // Record the exact report the console is about to receive, so what is
+    // captured is what the game saw, not an intermediate representation.
+    g_macro.record_feed(report.data().data(), (uint32_t)(esp_timer_get_time() / 1000));
+  }
+
+  // While a macro plays the engine owns the report; live input must not fight it.
+  if (!g_macro.playing() && g_ctl) g_ctl->set_input_report(report);
+}
+
+// HD rumble: turn the console's vibration frame into Steam Controller 2 motor
+// speeds. A 16-byte LRA block is [0x5n sequence][5-byte op][5-byte op][5-byte op]
+// (1 + 3*5 = 16) — the console queues up to three ops per block, so decoding only
+// the first one can read silence while a later slot is active. Each 5-byte op
+// holds four 10-bit fields in little-endian bit order: hi_freq, hi_amp, lo_freq,
+// lo_amp (0..1023).
+static uint16_t sc2_amp_from_block(const uint8_t *block, size_t avail) {
+  if (avail < 6) return 0;
+  const size_t ops = (avail - 1) / 5;
+  uint16_t best = 0;
+  for (size_t i = 0; i < ops && i < 3; ++i) {
+    const uint8_t *p = block + 1 + i * 5;
+    const uint16_t hi_amp = (uint16_t)(((p[1] >> 2) & 0x3F) | ((p[2] & 0x0F) << 6));
+    const uint16_t lo_amp = (uint16_t)(((p[3] >> 6) & 0x03) | (p[4] << 2));
+    const uint16_t amp = hi_amp > lo_amp ? hi_amp : lo_amp;
+    if (amp > best) best = amp;
+  }
+  return (uint16_t)((uint32_t)best * 65535u / 1023u);
 }
 
 extern "C" void app_main(void) {
@@ -130,8 +162,44 @@ extern "C" void app_main(void) {
   g_ctl = &controller;
   ESP_LOGI(TAG, "Switch 2 Pro Controller peripheral up — advertising");
 
+  // Rumble: the console streams HD-rumble frames on the vibration+command channel
+  // whether or not a command rides along, so mirror them onto the Steam Controller.
+  controller.on_vibration = [](const uint8_t *frame, size_t len) {
+    if (len < 13 || !g_sc2) return;
+    // The report-id byte is normally at [0], putting the block's 0x5n sequence at
+    // [1]. If the sequence nibble is at [0] instead the host omitted the id, and
+    // decoding from +1 would silently read garbage (~7% duty) instead of failing.
+    size_t off = 1;
+    if ((frame[1] & 0xF0) != 0x50 && (frame[0] & 0xF0) == 0x50) {
+      off = 0;
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        ESP_LOGW(TAG, "vibration frame without report id (len=%u) — decoding from 0",
+                 (unsigned)len);
+      }
+    }
+    const size_t rem = len - off;
+    const size_t stride = (rem >= 33) ? 16 : 6; // 42-byte form vs compact 13-byte form
+    const uint8_t *lb = frame + off;
+    const uint8_t *rb = lb + stride;
+    const size_t l_avail = rem < stride ? rem : stride;
+    const size_t r_avail = (rem > stride) ? ((rem - stride) < stride ? (rem - stride) : stride) : 0;
+    const uint16_t l = sc2_amp_from_block(lb, l_avail);
+    const uint16_t r = r_avail ? sc2_amp_from_block(rb, r_avail) : 0;
+    static uint32_t frames = 0;
+    if (frames < 6 || frames % 300 == 0) {
+      ESP_LOGI(TAG, "vib #%u len=%u off=%u left=%u right=%u | L %02x %02x %02x %02x %02x",
+               (unsigned)frames, (unsigned)len, (unsigned)off, (unsigned)l, (unsigned)r, lb[0],
+               lb[1], lb[2], lb[3], lb[4]);
+    }
+    ++frames;
+    g_sc2->set_rumble(l, r);
+  };
+
   // --- Steam Controller 2 central ------------------------------------------
   static Sc2Central sc2;
+  g_sc2 = &sc2;
   sc2.set_input_cb([](const s2s::Sc2Input &in) {
     s2s::Sc2Battery bat;
     {
@@ -147,6 +215,53 @@ extern "C" void app_main(void) {
     g_bat = b;
   });
   sc2.begin();
+
+  // --- macro engine + editor ----------------------------------------------
+  // The engine pushes reports straight into the BLE layer, so a macro plays at
+  // the connection interval rather than at the Steam Controller's sample rate.
+  g_macro.set_sink([](const espp::switch2::Pro2InputReport &r) {
+    if (g_ctl) g_ctl->set_input_report(r);
+  });
+  g_macro.begin();
+
+#if CONFIG_S2S_WEB_ENABLE
+  if (!macro_store::init()) {
+    ESP_LOGW(TAG, "macro storage unavailable — macros cannot be saved");
+  }
+  WebHooks hooks;
+  hooks.sc2_connected = [] { return sc2.connected(); };
+  hooks.console_connected = [] { return controller.is_connected(); };
+  hooks.console_streaming = [] { return controller.is_input_streaming(); };
+  // Test rumble from the web UI. The pad stops itself ~50 ms after the last
+  // write, so for a timed buzz we re-send nothing and simply stop early by
+  // writing zeroes from a one-shot timer. The timer is created once and rearmed.
+  hooks.rumble = [](uint16_t l, uint16_t r, uint32_t ms) {
+    if (!g_sc2) return;
+    g_sc2->set_rumble(l, r);
+    if (ms == 0) return;
+    static esp_timer_handle_t stop_timer = nullptr;
+    if (!stop_timer) {
+      const esp_timer_create_args_t args = {
+          .callback = [](void *) {
+            if (g_sc2) g_sc2->set_rumble(0, 0);
+          },
+          .arg = nullptr,
+          .dispatch_method = ESP_TIMER_TASK,
+          .name = "rumble_stop",
+          .skip_unhandled_events = true,
+      };
+      if (esp_timer_create(&args, &stop_timer) != ESP_OK) {
+        stop_timer = nullptr;
+        return;
+      }
+    }
+    esp_timer_stop(stop_timer); // harmless if it already fired
+    esp_timer_start_once(stop_timer, (uint64_t)ms * 1000);
+  };
+  if (!web_server_begin(g_macro, hooks)) {
+    ESP_LOGE(TAG, "macro editor failed to start");
+  }
+#endif
 
   int lr_ticks = 0;
   bool prev_streaming = false;
@@ -166,6 +281,12 @@ extern "C" void app_main(void) {
       std::lock_guard<std::mutex> lk(g_mtx);
       in = g_in;
       bat = g_bat;
+    }
+
+    // Keep the macro engine's battery field in step with what the pad reports,
+    // so a macro played while the console is up shows the right level.
+    if (bat.valid) {
+      g_macro.set_battery(static_cast<uint8_t>((bat.level_pct * 9u + 50u) / 100u), bat.charging);
     }
 
     // Any fresh button press while the console is not connected -> wake it,

@@ -2,3 +2,6 @@
 nvs,      data, nvs,     0x9000,  0x6000
 phy_init, data, phy,     0xf000,  0x1000
 factory,  app,  factory, 0x10000, 2M
+# Macro library. A separate SPIFFS partition keeps macro writes away from NVS,
+# so saving macros can never disturb the BLE bonds stored there.
+storage,  data, spiffs,  0x210000, 1M

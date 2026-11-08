@@ -1,6 +1,4 @@
-# Dependencies fetched by tools/setup.sh
-_refs/
-
+# espp is a git submodule at _refs/espp (pinned), so it must stay trackable.
 # ESP-IDF build output
 build/
 sdkconfig
