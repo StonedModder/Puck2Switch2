@@ -5,6 +5,8 @@ A Steam Controller 2 that behaves as a Switch 2 Pro Controller.
 Plug in an ESP32-S3, pair your Steam Controller 2 over Bluetooth, and the Switch 2
 sees a normal Pro Controller.
 
+[![Puck2Switch2 streaming gyro to a Switch 2](docs/demo.webp)](docs/demo.mp4)
+
 ## Features
 
 - **1:1 mimic of a Switch 2 Pro Controller** — the console believes it is one
