@@ -28,10 +28,17 @@ sees a normal Pro Controller.
 Requires [ESP-IDF v6.1](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/get-started/).
 
 ```sh
-./tools/setup.sh
+git clone https://github.com/StonedModder/Puck2Switch2.git
+cd Puck2Switch2
+./tools/setup.sh                      # espp submodule + nested deps + local patches
 idf.py -C firmware/esp32s3 build
 idf.py -C firmware/esp32s3 -p /dev/ttyACM0 flash
 ```
+
+`tools/setup.sh` is idempotent and must run once before the first build: the
+firmware resolves espp straight off disk (`IDF_COMPONENT_MANAGER=0`), so an
+uninitialised submodule fails the build. It also applies the local
+`switch2_pro` patches from `tools/patches/`.
 
 ## Pairing
 

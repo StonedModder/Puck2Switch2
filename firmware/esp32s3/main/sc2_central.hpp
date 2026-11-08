@@ -50,6 +50,15 @@ public:
   void set_input_cb(InputCb cb) { input_cb_ = std::move(cb); }
   void set_battery_cb(BatteryCb cb) { battery_cb_ = std::move(cb); }
 
+  /// HD-rumble output. Writes output report 0x80 (report-id byte stripped) to the
+  /// Valve haptic characteristic 100f6cb5 without response:
+  ///   [type=0][intensity u16=0][left u16][left gain=0][right u16][right gain=0]
+  /// Speeds are 0..65535. The pad stops on its own ~50 ms after the last write, so
+  /// while either speed is non-zero loop() re-sends every 25 ms; if no new value
+  /// arrives for 150 ms the output is forced to zero (a game that stops streaming
+  /// mid-effect must not leave the motors running). Safe to call from any task.
+  void set_rumble(uint16_t left_speed, uint16_t right_speed);
+
 private:
   void onResult(const NimBLEAdvertisedDevice *dev) override;
   void onScanEnd(const NimBLEScanResults &results, int reason) override;
@@ -64,6 +73,15 @@ private:
 
   NimBLEClient *client_{nullptr};
   NimBLERemoteCharacteristic *feat_chr_{nullptr};
+  NimBLERemoteCharacteristic *rumble_chr_{nullptr};
+  std::atomic<uint16_t> rumble_left_{0};
+  std::atomic<uint16_t> rumble_right_{0};
+  std::atomic<int64_t> rumble_last_us_{0};
+  uint16_t rumble_sent_left_{0};
+  uint16_t rumble_sent_right_{0};
+  int64_t last_rumble_us_{0};
+  uint32_t rumble_writes_{0};
+  uint32_t rumble_failures_{0};
   // Connection-parameter upgrade is retried after the link settles: requesting it
   // immediately after subscribing is refused by the stack, leaving the pad on a
   // ~45 ms default interval (22 Hz).

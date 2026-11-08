@@ -15,6 +15,7 @@ static const char *VALVE_IN45 = "100f6c7a-1735-4313-b402-38567131e5f3";
 static const char *VALVE_IN47 = "100f6c7c-1735-4313-b402-38567131e5f3";
 static const char *VALVE_FEAT = "100f6c34-1735-4313-b402-38567131e5f3";
 static const char *VALVE_BATT = "100f6c78-1735-4313-b402-38567131e5f3";
+static const char *VALVE_RUMBLE = "100f6cb5-1735-4313-b402-38567131e5f3";
 
 // Feature-report payloads (report-id byte stripped, as sent on air).
 // {0x87 = ID_SET_SETTINGS_VALUES, 0x03 = sizeof(ControllerSetting), setting, u16 value}
@@ -266,6 +267,30 @@ bool Sc2Central::setup_gatt() {
     if (!feat_chr_) ESP_LOGE(TAG, "feature characteristic missing — lizard-off unavailable");
   }
 
+  // Haptic output (rumble). Same fallback treatment: after a re-pair the service
+  // can come back under a new instance, so search the tree by UUID.
+  rumble_chr_ = svc->getCharacteristic(NimBLEUUID(std::string(VALVE_RUMBLE)));
+  if (!rumble_chr_) {
+    for (auto *s : client_->getServices(/*refresh=*/true)) {
+      if (!s) continue;
+      auto *c = s->getCharacteristic(NimBLEUUID(std::string(VALVE_RUMBLE)));
+      if (c) {
+        rumble_chr_ = c;
+        break;
+      }
+    }
+  }
+  if (rumble_chr_) {
+    // A write that returns true only means "queued", not "delivered", so record
+    // what the characteristic actually advertises — if the pad stays silent this
+    // is the first thing to check (Write Request vs Write Without Response).
+    ESP_LOGI(TAG, "haptic characteristic 100f6cb5 ready (handle 0x%04x, write=%d write_nr=%d)",
+             rumble_chr_->getHandle(), (int)rumble_chr_->canWrite(),
+             (int)rumble_chr_->canWriteNoResponse());
+  } else {
+    ESP_LOGE(TAG, "haptic characteristic missing — rumble unavailable");
+  }
+
   NimBLERemoteCharacteristic *batt = svc->getCharacteristic(NimBLEUUID(std::string(VALVE_BATT)));
   if (batt) {
     batt->subscribe(true, [this](NimBLERemoteCharacteristic *, uint8_t *d, size_t len, bool) {
@@ -418,6 +443,12 @@ bool Sc2Central::request_fast_interval() {
   return false;
 }
 
+void Sc2Central::set_rumble(uint16_t left_speed, uint16_t right_speed) {
+  rumble_left_.store(left_speed);
+  rumble_right_.store(right_speed);
+  rumble_last_us_.store(esp_timer_get_time());
+}
+
 void Sc2Central::loop() {
   report_visible(esp_timer_get_time());
   if (connected_.load()) {
@@ -430,6 +461,42 @@ void Sc2Central::loop() {
         params_attempts_ = 99; // done
       }
     }
+    // HD rumble: the pad's haptic watchdog drops the motors ~50 ms after the last
+    // output report. loop() ticks at 10 ms, so a 40 ms gate can actually fire at
+    // 45-50 ms — right at the timeout. 25 ms keeps a real margin. A value that
+    // stops updating for 150 ms is forced to zero, so a game that stops streaming
+    // mid-effect cannot leave the motors running.
+    uint16_t rl = rumble_left_.load();
+    uint16_t rr = rumble_right_.load();
+    if ((rl || rr) && now - rumble_last_us_.load() > 150000) {
+      rl = rr = 0;
+      rumble_left_.store(0);
+      rumble_right_.store(0);
+    }
+    const bool active = rl != 0 || rr != 0;
+    const bool dirty = rl != rumble_sent_left_ || rr != rumble_sent_right_;
+    if (rumble_chr_ && (active ? (now - last_rumble_us_ >= 25000) : dirty)) {
+      uint8_t rmb[9] = {0x00, 0x00, 0x00,
+                        (uint8_t)(rl & 0xFF), (uint8_t)(rl >> 8), 0x00,
+                        (uint8_t)(rr & 0xFF), (uint8_t)(rr >> 8), 0x00};
+      const bool ok = rumble_chr_->writeValue(rmb, sizeof(rmb), /*response=*/false);
+      if (ok) {
+        ++rumble_writes_;
+        if (rumble_writes_ <= 3 || (!active && rumble_writes_ % 50 == 0)) {
+          ESP_LOGI(TAG, "rumble write #%u left=%u right=%u", (unsigned)rumble_writes_,
+                   (unsigned)rl, (unsigned)rr);
+        }
+      } else {
+        ++rumble_failures_;
+        if (rumble_failures_ <= 5) {
+          ESP_LOGW(TAG, "rumble write failed (%u)", (unsigned)rumble_failures_);
+        }
+      }
+      rumble_sent_left_ = rl;
+      rumble_sent_right_ = rr;
+      last_rumble_us_ = now;
+    }
+
     if (now - last_keepalive_us_ >= KEEPALIVE_US) {
       send_keepalive(/*include_imu=*/false);
       last_keepalive_us_ = now;

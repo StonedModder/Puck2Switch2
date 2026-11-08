@@ -1,0 +1,150 @@
+diff --git a/components/switch2_pro/include/switch2_pro.hpp b/components/switch2_pro/include/switch2_pro.hpp
+index f24f5f9..a038efb 100644
+--- a/components/switch2_pro/include/switch2_pro.hpp
++++ b/components/switch2_pro/include/switch2_pro.hpp
+@@ -150,6 +150,17 @@ public:
+     input_report_ = report;
+   }
+ 
++  /// HD-rumble tap. The console writes the vibration payload on the
++  /// vibration+command channel (0x0016) ahead of the 8-byte command header:
++  ///   [0]      0x00 (report id, Bluetooth)
++  ///   [1..16]  left LRA block  — [0]=0x5n sequence, [1..5]=packed sample
++  ///   [17..32] right LRA block — same layout
++  /// Each packed 5-byte sample is four 10-bit fields, little-endian bit order:
++  ///   hi_freq | hi_amp | lo_freq | lo_amp   (all 0..1023)
++  /// A vibration-only write is exactly 33 bytes (no command follows). Called on
++  /// the NimBLE host task — keep the body cheap and never block.
++  std::function<void(const uint8_t *frame, size_t len)> on_vibration;
++
+   /// Advertisement variant. Discovery = fresh pairing (zero host addr). Reconnect
+   /// = we already have a bond; the paired console's address is embedded so it
+   /// recognises us and reconnects (skipping the 0x15 pairing). Wake = like
+@@ -186,6 +197,11 @@ protected:
+   /// writes on 0x0014 which reply on 0x001a. Parses the 8-byte header and
+   /// dispatches, notifying a response.
+   void on_command_write(bool via_vibration_command, const uint8_t *data, size_t len);
++  /// Write on the dedicated vibration characteristic (0x0012) — the console's
++  /// rumble output report. Payload: [0x00 report id][left LRA block][right LRA
++  /// block], 16-byte blocks in the documented 42-byte frame and 6-byte blocks in
++  /// the compact 13-byte form some hosts send. Forwarded to on_vibration.
++  void on_vibration_write(const uint8_t *data, size_t len);
+   void handle_pairing(bool via_vibration_command, uint8_t transport, switch2::PairingSub sub,
+                       const uint8_t *payload, size_t len);
+   void handle_command(bool via_vibration_command, switch2::Command cmd, uint8_t transport,
+diff --git a/components/switch2_pro/include/switch2_pro_report.hpp b/components/switch2_pro/include/switch2_pro_report.hpp
+index 93ae2ed..88ced02 100644
+--- a/components/switch2_pro/include/switch2_pro_report.hpp
++++ b/components/switch2_pro/include/switch2_pro_report.hpp
+@@ -79,6 +79,16 @@ public:
+ 
+   const std::array<uint8_t, SIZE> &data() const { return data_; }
+ 
++  /// Puck2Switch2 addition: copy a raw motion block into the report.
++  /// @param blk         motion payload bytes
++  /// @param len         payload length (<= 0x28)
++  /// @param motion_len  value for report byte 0x0E (e.g. 0x1E = 30-byte carrier)
++  void set_motion_block(const uint8_t *blk, size_t len, uint8_t motion_len) {
++    if (len > 0x28) len = 0x28;
++    data_[0x0e] = motion_len;
++    std::memcpy(&data_[0x0f], blk, len);
++  }
++
+ private:
+   static uint16_t axis_to_u12(float v) {
+     if (v < -1.f)
+diff --git a/components/switch2_pro/src/switch2_pro.cpp b/components/switch2_pro/src/switch2_pro.cpp
+index f0ae672..27fe91d 100644
+--- a/components/switch2_pro/src/switch2_pro.cpp
++++ b/components/switch2_pro/src/switch2_pro.cpp
+@@ -57,6 +57,8 @@ public:
+       owner_->on_command_write(/*via_vibration_command=*/false, value.data(), value.size());
+     else if (role_ == 2)
+       owner_->on_command_write(/*via_vibration_command=*/true, value.data(), value.size());
++    else if (role_ == 3)
++      owner_->on_vibration_write(value.data(), value.size());
+   }
+   void onRead(NimBLECharacteristic * /*c*/, NimBLEConnInfo & /*conn*/) override {
+     owner_->logger_.info("READ  {}", name_);
+@@ -267,7 +269,11 @@ void Switch2Pro::configure_security() {
+   // Only clear bonds on a FRESH start. If we have a persisted bond we are in
+   // reconnection mode and must KEEP the injected LTK so the console can re-encrypt
+   // without re-pairing.
+-  if (!reconnect_mode_) {
++  // Puck2Switch2: do NOT wipe all BLE bonds here — the Steam Controller 2
++  // central keeps its bond in the same store, and the Switch 2 never uses
++  // SMP bonding (it pairs at the application layer over 0x15), so there is
++  // nothing stale for this sweep to clean up.
++  if (false && !reconnect_mode_) {
+     size_t cleared = ble_gatt_server_.unpair_all().size();
+     if (cleared)
+       logger_.info("cleared {} stale BLE bond(s)", cleared);
+@@ -449,7 +455,7 @@ bool Switch2Pro::build_gatt() {
+   attach(pro2_input_, "pro2_input(0x000e)", 0);
+   add_desc(pro2_input_, REPORT_RATE_DESC_UUID);
+   attach(svc2->createCharacteristic(NimBLEUUID(VIBRATION_UUID), NIMBLE_PROPERTY::WRITE_NR),
+-         "vibration(0x0012)", 0);
++         "vibration(0x0012)", 3);
+   command_ = svc2->createCharacteristic(NimBLEUUID(COMMAND_UUID), NIMBLE_PROPERTY::WRITE_NR);
+   attach(command_, "command(0x0014)", 1);
+   vibration_command_ =
+@@ -707,18 +713,45 @@ void Switch2Pro::send_ack(bool via_vibration_command, uint8_t cmd, uint8_t trans
+ // Command dispatch
+ // ---------------------------------------------------------------------------
+ 
++void Switch2Pro::on_vibration_write(const uint8_t *data, size_t len) {
++  // This path was silent below 13 bytes, which made a wrong-length or
++  // report-id-less frame undiagnosable. Log every write (rate-limited) so a live
++  // capture always shows whether the console is talking to us at all.
++  static uint32_t writes = 0;
++  const bool log_now = writes < 8 || (writes % 200) == 0;
++  if (log_now) {
++    const uint8_t b0 = len > 0 ? data[0] : 0;
++    const uint8_t b1 = len > 1 ? data[1] : 0;
++    const uint8_t b2 = len > 2 ? data[2] : 0;
++    logger_.info("vib write #{} len={} b={:02x} {:02x} {:02x} seq@1={}", writes, len, b0, b1, b2,
++                 (b1 & 0xF0) == 0x50 ? "ok" : "NO");
++  }
++  ++writes;
++  if (!on_vibration || len < 13) return;
++  on_vibration(data, len);
++}
++
+ void Switch2Pro::on_command_write(bool via_vibration_command, const uint8_t *data, size_t len) {
+   log_hex(via_vibration_command ? "cmd<-0x0016" : "cmd<-0x0014", data, len);
+   // On the vibration+command channel (0x0016) the 8-byte command header follows a
+   // fixed 33-byte vibration payload; skip it so the command id/subcommand parse
+   // from the right offset. The command-only channel (0x0014) has no such prefix.
+   if (via_vibration_command) {
+-    if (len < VIBRATION_COMMAND_PREFIX_SIZE + COMMAND_HEADER_SIZE) {
++    if (len == COMMAND_HEADER_SIZE) {
++      // Documented command-only frame on this channel: 8 bytes, no vibration
++      // prefix at all (this is what the real Pro Controller 2 init sequence
++      // sends). Parse it as-is rather than rejecting it as a short write.
++    } else if (len >= VIBRATION_COMMAND_PREFIX_SIZE) {
++      // Vibration rides ahead of the command; a vibration-only write carries no
++      // command, so hand the payload over before any early return.
++      if (on_vibration) on_vibration(data, VIBRATION_COMMAND_PREFIX_SIZE);
++      if (len < VIBRATION_COMMAND_PREFIX_SIZE + COMMAND_HEADER_SIZE) return;
++      data += VIBRATION_COMMAND_PREFIX_SIZE;
++      len -= VIBRATION_COMMAND_PREFIX_SIZE;
++    } else {
+       logger_.warn("short vibration+command write ({} bytes)", len);
+       return;
+     }
+-    data += VIBRATION_COMMAND_PREFIX_SIZE;
+-    len -= VIBRATION_COMMAND_PREFIX_SIZE;
+   }
+   if (len < COMMAND_HEADER_SIZE) {
+     logger_.warn("short command write ({} bytes)", len);
+@@ -998,7 +1031,9 @@ bool Switch2Pro::send_input_report(
+   // of being hardcoded, so the flags always match the negotiated mask.
+   buf[0x0b] = (enabled_features_ & switch2::FEATURE_RUMBLE) ? 0x38 : 0x30;
+   if (enabled_features_ & switch2::FEATURE_IMU) {
+-    buf[0x0e] = 0x28; // motion data length (40) — always present once IMU is enabled
++    // Puck2Switch2: respect an app-supplied motion length (0x1E = the 30-byte
++    // quaternion carrier this project emits); default to 0x28 as upstream did.
++    if (buf[0x0e] == 0) buf[0x0e] = 0x28;
+     if (imu_motion_enabled_) {
+       // Replay captured resting-motion frames. NOTE: the sequence loops (128
+       // frames ≈ 2 s at 62 Hz), so its embedded timestamps jump backwards at the
