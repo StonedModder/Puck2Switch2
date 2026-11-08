@@ -1,0 +1,23 @@
+menu "Steam2Switch2 adapter"
+
+    config S2S_SC2_MAC
+        string "Steam Controller 2 MAC address(es)"
+        default ""
+        help
+            Optional allowlist of BLE addresses, comma/space separated, e.g.
+            "c1:2a:3b:4c:5d:6e" or "c1:2a:3b:4c:5d:6e, d4:11:22:33:44:55".
+
+            A device whose address matches is accepted even if it does not
+            advertise a "Steam" name and does not advertise the Valve service
+            UUID. Left empty, matching falls back to name + Valve service only.
+            Consumed by the Steam Controller 2 central (sc2_central.cpp).
+
+    config S2S_SC2_MAC_ONLY
+        bool "Connect ONLY to the configured MAC address(es)"
+        default n
+        help
+            Ignore name / Valve-service matching entirely and accept only the
+            addresses in S2S_SC2_MAC. Use this once the controller's address is
+            known, so no other Steam-named device can be picked up by mistake.
+
+endmenu

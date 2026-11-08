@@ -1,0 +1,15 @@
+# Dependencies fetched by tools/setup.sh
+_refs/
+
+# ESP-IDF build output
+build/
+sdkconfig
+sdkconfig.old
+*.elf
+*.map
+*.bin
+*.uf2
+
+# Misc
+*.log
+.DS_Store

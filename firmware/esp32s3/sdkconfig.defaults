@@ -1,0 +1,60 @@
+# ESP32-S3, ESP-IDF >= v6.1
+CONFIG_IDF_TARGET="esp32s3"
+
+# Logs go out over the native USB-Serial-JTAG (/dev/ttyACM0), which is also the
+# flashing + JTAG port on this board.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Flash: 4 MB is safe on any ESP32-S3 devkit (>= 4 MB); verify with
+# `esptool.py flash_id` before changing.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# BLE only (NimBLE). No Wi-Fi: coexistence arbitration injects tx latency that
+# shows up as stalled notifications under sustained streaming.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+# Pin the BT controller + NimBLE host to core 1, away from the app task, so the
+# ~62 Hz notify loop cannot starve the host and exhaust tx credits (ENOMEM wedge).
+CONFIG_BT_CTRL_PINNED_TO_CORE_1=y
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_1=y
+
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_GAP_DEVICE_NAME_MAX_LEN=100
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
+
+# A real Pro Controller 2 answers the console's 512-byte ATT MTU with 512; the
+# console stalls after the MTU exchange if we grant less.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=512
+
+# mbuf headroom for sustained streaming (default 12 MSYS blocks is tight).
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=100
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=48
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=40
+CONFIG_BT_CTRL_BLE_STATIC_ACL_TX_BUF_NB=12
+
+CONFIG_BT_NIMBLE_MAX_BONDS=3
+CONFIG_BT_NIMBLE_MAX_CCCDS=128
+
+# --- dual role: peripheral (Switch 2) + central (Steam Controller 2) ---------
+# Two simultaneous connections are required: one to the console, one to the SC2.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+
+# The console drives the link at a sub-spec 5 ms interval for sustained input,
+# reconnect and wake. On ESP32-S3 this is the official, default-on option in
+# ESP-IDF >= v6.1; keep it explicit so a config change cannot silently break it.
+CONFIG_BT_CTRL_BLE_MIN_CONN_INTERVAL_ENABLE=y
