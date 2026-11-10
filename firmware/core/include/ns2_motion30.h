@@ -176,8 +176,14 @@ struct MahonyFilter {
 
     float ax = accel_g[0], ay = accel_g[1], az = accel_g[2];
     const float an = std::sqrt(ax * ax + ay * ay + az * az);
-    if (an < 0.01f) return; // free fall / no gravity reference: gyro only
-    ax /= an; ay /= an; az /= an;
+    // Magnitude alone cannot detect all linear acceleration, but suppressing
+    // implausible gravity observations prevents strong dynamic corrections.
+    const float deviation = std::fabs(an - 1.0f);
+    float trust = (0.20f - deviation) / 0.12f;
+    if (trust < 0.0f) trust = 0.0f;
+    if (trust > 1.0f) trust = 1.0f;
+    if (an > 0.01f) { ax /= an; ay /= an; az /= an; }
+    else { ax = ay = az = 0.0f; trust = 0.0f; }
 
     // Estimated gravity direction from the current attitude.
     const float qw = q[0], qx = q[1], qy = q[2], qz = q[3];
@@ -186,9 +192,9 @@ struct MahonyFilter {
     const float vz = qw * qw - qx * qx - qy * qy + qz * qz;
 
     // Error = measured x estimated gravity.
-    const float ex = ay * vz - az * vy;
-    const float ey = az * vx - ax * vz;
-    const float ez = ax * vy - ay * vx;
+    const float ex = trust * (ay * vz - az * vy);
+    const float ey = trust * (az * vx - ax * vz);
+    const float ez = trust * (ax * vy - ay * vx);
 
     if (ki > 0.0f) {
       integral[0] += ki * ex * dt;
