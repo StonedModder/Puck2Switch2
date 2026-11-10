@@ -10,6 +10,23 @@
 
 namespace s2s {
 
+/// Scale a 0..100 % battery reading to the Switch 2 report's 0..9 bar field.
+/// A nonzero percentage never rounds down to 0, because 0 means EMPTY on the
+/// wire and the console reacts to it by warning and dropping the link.
+inline uint8_t sc2_battery_bars(uint8_t level_pct) {
+  if (level_pct == 0) return 0; // genuine empty, reported honestly
+  if (level_pct > 100) level_pct = 100;
+  uint8_t bars = static_cast<uint8_t>((level_pct * 9u + 50u) / 100u);
+  if (bars == 0) bars = 1; // not empty unless truly empty
+  return bars;
+}
+
+/// Power byte to use before any real reading exists. Shared with espp's
+/// Pro2InputReport default so no code path can stream a false zero.
+inline uint8_t sc2_battery_bars_unknown() {
+  return espp::switch2::Pro2InputReport::DEFAULT_BATTERY_LEVEL;
+}
+
 inline void apply_sc2_to_pro2(const Sc2Input &in, const Sc2Battery &bat, const MapConfig &cfg,
                               espp::switch2::Pro2InputReport &ref) {
   const bool south = in.pressed(SC2_A);
@@ -62,11 +79,7 @@ inline void apply_sc2_to_pro2(const Sc2Input &in, const Sc2Battery &bat, const M
   // the first notification arrives bat.valid is false, and advertising an empty
   // battery made the console treat the pad as dying (battery warnings / drops).
   // Report full until a real reading lands, then scale it.
-  uint8_t lvl9 = 9;
-  if (bat.valid) {
-    lvl9 = static_cast<uint8_t>((bat.level_pct * 9u + 50u) / 100u);
-    if (lvl9 == 0 && bat.level_pct > 0) lvl9 = 1; // not empty unless truly empty
-  }
+  const uint8_t lvl9 = bat.valid ? sc2_battery_bars(bat.level_pct) : sc2_battery_bars_unknown();
   ref.set_power(lvl9, bat.charging, false);
 }
 
