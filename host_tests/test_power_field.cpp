@@ -191,6 +191,27 @@ int main() {
     check("h: no other setter can zero the power byte", !bad, d);
   }
 
+  // Common 0x05 report: battery voltage field and power mapping.
+  {
+    Pro2InputReport r;
+    std::array<uint8_t, espp::switch2::COMMON_INPUT_SIZE> common{};
+    espp::switch2::build_common_input_report(r, 0x12345678u, common);
+    unsigned mv = common[0x1f] | (unsigned(common[0x20]) << 8);
+    char d[160];
+    std::snprintf(d, sizeof d, "bytes=0x%02X%02X voltage=%u mV", common[0x20], common[0x1f], mv);
+    check("i: default common report has healthy voltage", mv == 4200, d);
+    r.set_power(0, false, false);
+    espp::switch2::build_common_input_report(r, 0, common);
+    mv = common[0x1f] | (unsigned(common[0x20]) << 8);
+    std::snprintf(d, sizeof d, "bytes=0x%02X%02X voltage=%u mV", common[0x20], common[0x1f], mv);
+    check("j: genuine empty has lower estimated voltage", mv == 3300, d);
+    r.set_power(5, true, false);
+    espp::switch2::build_common_input_report(r, 0, common);
+    mv = common[0x1f] | (unsigned(common[0x20]) << 8);
+    std::snprintf(d, sizeof d, "voltage=%u mV charge=0x%02X", mv, common[0x21]);
+    check("k: mid battery and charging", mv == 3800 && common[0x21] == 0x34, d);
+  }
+
   std::printf("\n%s (%d failure%s)\n", g_fail ? "RESULT: FAIL" : "RESULT: PASS", g_fail,
               g_fail == 1 ? "" : "s");
   return g_fail ? 1 : 0;
