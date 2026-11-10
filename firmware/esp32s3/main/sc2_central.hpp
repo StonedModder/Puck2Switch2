@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "NimBLEDevice.h"
+#include "ble_radio_policy.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "sc2_core.h"
@@ -38,10 +39,16 @@ public:
   bool begin();
   /// Drive connection state machine + lizard-off keepalive. Call from one task.
   void loop();
-  /// Drop the scan to a low duty cycle while the Switch 2 link is active. An
-  /// 80% duty scan competes with the console's 5 ms link for the single radio
-  /// and shows up as dropped input, so scanning becomes a 2.5% trickle instead.
-  void set_scan_paused(bool paused);
+  /// Compatibility shim for the historical single-bool call: equivalent to
+  /// set_link_state(sc2_linked, <last reported console state>).
+  void set_scan_paused(bool sc2_linked);
+
+  /// Report BOTH link states and pick the scan duty from them
+  /// (s2s::scan_duty_for, host-tested in host_tests/test_ble_radio_policy.cpp).
+  /// There are three regimes, not two: a scan that is fine while nothing else
+  /// uses the radio is NOT fine while the peripheral still has to be discovered
+  /// by an idle console — the old code ran 80 % duty in exactly that state.
+  void set_link_state(bool sc2_linked, bool console_linked);
 
   bool connected() const { return connected_.load(); }
   bool ever_seen() const { return seen_count_.load() > 0; }
@@ -70,6 +77,7 @@ private:
   void handle_notification(uint8_t report_id, const uint8_t *data, size_t len);
   void send_keepalive(bool include_imu);
   bool request_fast_interval();
+  void apply_scan_duty(const s2s::ScanDuty &d);
 
   NimBLEClient *client_{nullptr};
   NimBLERemoteCharacteristic *feat_chr_{nullptr};
@@ -122,6 +130,12 @@ private:
 
   std::atomic<bool> scan_started_{false};
   std::atomic<bool> scan_paused_{false};
+  /// Last console-link state reported by the app, so the one-argument
+  /// set_scan_paused() shim can still pick the right three-way duty.
+  std::atomic<bool> console_linked_{false};
+  /// Scan duty currently programmed into the controller, so a repeated
+  /// state report never stops/restarts the scan for nothing.
+  s2s::ScanDuty duty_{0, 0, "unset"};
   bool imu_enabled_{false};
   int64_t last_keepalive_us_{0};
   uint32_t raw_dumps_{0};
