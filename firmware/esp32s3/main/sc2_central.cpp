@@ -4,7 +4,6 @@
 #include <cctype>
 #include <cstring>
 
-#include "ble_radio_policy.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -43,17 +42,9 @@ bool Sc2Central::begin() {
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(this, false);
   scan->setActiveScan(true); // need the scan response for the device name
-  // Start at the SEARCH duty, NOT the old 100/80 (80 %). At boot neither link is
-  // up, and the peripheral has to be *discoverable* by the console at the same
-  // time as we are discovering the controller — an 80 % scan leaves ~20 % of the
-  // radio for advertising events and is the radio half of the slow-discovery bug.
-  // See firmware/core/include/ble_radio_policy.h for the arithmetic.
-  {
-    const s2s::ScanDuty d = s2s::scan_duty_for(/*sc2_linked=*/false, /*console_linked=*/false);
-    scan->setInterval(d.interval_units);
-    scan->setWindow(d.window_units);
-    duty_ = d;
-  }
+  const auto duty = s2s::sc2_scan_params();
+  scan->setInterval(duty.interval_ms);
+  scan->setWindow(duty.window_ms);
   scan->setDuplicateFilter(0);
 
   // The Steam Controller 2 will not stream notifications until the link is
@@ -78,37 +69,11 @@ bool Sc2Central::begin() {
   return true;
 }
 
-void Sc2Central::set_scan_paused(bool sc2_linked) {
-  // Compatibility entry point (app_main's historical single-bool call). The
-  // console link state is whatever was last reported through set_link_state();
-  // if the app never reports it we still get the important half of the fix —
-  // SC2 down now means a 25 % scan instead of 80 %.
-  set_link_state(sc2_linked, console_linked_.load());
-}
-
-void Sc2Central::set_link_state(bool sc2_linked, bool console_linked) {
-  console_linked_.store(console_linked);
-  scan_paused_.store(sc2_linked);
-  apply_scan_duty(s2s::scan_duty_for(sc2_linked, console_linked));
-}
-
-void Sc2Central::apply_scan_duty(const s2s::ScanDuty &d) {
-  if (d.interval_units == duty_.interval_units && d.window_units == duty_.window_units)
-    return; // unchanged — do not churn the scan
-  duty_ = d;
-  NimBLEScan *s = NimBLEDevice::getScan();
-  // Cheap throttle only. NimBLEScan::stop() also frees the results and waiting
-  // lists, which raced with the stack's teardown and produced a heap abort and
-  // an immediate local link termination (HCI 0x16) one loop tick after the pad
-  // came up — so only ever change the duty, never tear the scan down for good.
-  s->setInterval(d.interval_units);
-  s->setWindow(d.window_units);
-  // New parameters only take effect on a fresh scan; loop()/onDisconnect restart it.
-  if (scan_started_.exchange(false)) s->stop();
-  ESP_LOGI(TAG, "scan duty -> %s (interval %u u = %u ms, window %u u = %u ms, %u.%u%%)", d.name,
-           (unsigned)d.interval_units, (unsigned)(d.interval_units * 5u / 8u),
-           (unsigned)d.window_units, (unsigned)(d.window_units * 5u / 8u),
-           s2s::scan_duty_permille(d) / 10u, s2s::scan_duty_permille(d) % 10u);
+void Sc2Central::set_scan_paused(bool /*paused*/) {
+  // Fixed low duty from begin(): do not cancel a running scan merely because a
+  // link changed state. NimBLEScan::stop() clears internal scan lists and has
+  // caused link teardown races. A scan is still cancelled to initiate the SC2
+  // connection in onResult() (existing behavior; see NimBLEClient::connect()).
 }
 
 void Sc2Central::start_scan() {

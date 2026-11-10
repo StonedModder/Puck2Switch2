@@ -15,6 +15,17 @@
 //      cross-checked against CouchTurtle/sc2-research (MIT) and SDL3.
 #pragma once
 
+// NimBLEScan accepts milliseconds, NOT raw 0.625-ms HCI units.
+// Fixed scan parameters avoid cancelling a scan merely to change its duty while
+// a link is active. 100 ms / 10 ms = 10%, leaving radio time for advertising
+// and the console link. Scan timing and real discovery latency require hardware.
+namespace s2s {
+struct ScanParams { unsigned interval_ms; unsigned window_ms; };
+constexpr ScanParams sc2_scan_params() { return {100, 10}; }
+constexpr unsigned ble_scan_units(unsigned ms) { return ms * 8u / 5u; }
+} // namespace s2s
+
+#ifndef S2S_SCAN_POLICY_ONLY
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -24,7 +35,6 @@
 #include <vector>
 
 #include "NimBLEDevice.h"
-#include "ble_radio_policy.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "sc2_core.h"
@@ -39,16 +49,8 @@ public:
   bool begin();
   /// Drive connection state machine + lizard-off keepalive. Call from one task.
   void loop();
-  /// Compatibility shim for the historical single-bool call: equivalent to
-  /// set_link_state(sc2_linked, <last reported console state>).
-  void set_scan_paused(bool sc2_linked);
-
-  /// Report BOTH link states and pick the scan duty from them
-  /// (s2s::scan_duty_for, host-tested in host_tests/test_ble_radio_policy.cpp).
-  /// There are three regimes, not two: a scan that is fine while nothing else
-  /// uses the radio is NOT fine while the peripheral still has to be discovered
-  /// by an idle console — the old code ran 80 % duty in exactly that state.
-  void set_link_state(bool sc2_linked, bool console_linked);
+  /// Compatibility shim: scanning uses a fixed low duty in every state.
+  void set_scan_paused(bool paused);
 
   bool connected() const { return connected_.load(); }
   bool ever_seen() const { return seen_count_.load() > 0; }
@@ -77,7 +79,6 @@ private:
   void handle_notification(uint8_t report_id, const uint8_t *data, size_t len);
   void send_keepalive(bool include_imu);
   bool request_fast_interval();
-  void apply_scan_duty(const s2s::ScanDuty &d);
 
   NimBLEClient *client_{nullptr};
   NimBLERemoteCharacteristic *feat_chr_{nullptr};
@@ -129,14 +130,9 @@ private:
   void report_visible(int64_t now_us);
 
   std::atomic<bool> scan_started_{false};
-  std::atomic<bool> scan_paused_{false};
-  /// Last console-link state reported by the app, so the one-argument
-  /// set_scan_paused() shim can still pick the right three-way duty.
-  std::atomic<bool> console_linked_{false};
-  /// Scan duty currently programmed into the controller, so a repeated
-  /// state report never stops/restarts the scan for nothing.
-  s2s::ScanDuty duty_{0, 0, "unset"};
   bool imu_enabled_{false};
   int64_t last_keepalive_us_{0};
   uint32_t raw_dumps_{0};
 };
+
+#endif // S2S_SCAN_POLICY_ONLY
