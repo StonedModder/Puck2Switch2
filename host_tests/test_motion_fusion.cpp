@@ -59,10 +59,15 @@ int main(){
   while(t<30){float dt=jitter(rng);t+=dt;float g[3]={2+noise(rng),2+noise(rng),2+noise(rng)};p.update(g,a,dt);maxerr=std::max(maxerr,angle(p.attitude.q));}
   std::printf("JITTER 30s 7-45ms, noise sigma .2 dps: final=%.4f max=%.4f deg\n",angle(p.attitude.q),maxerr);
   check(maxerr<2.5f,"jitter worst attitude error",maxerr,2.5);
-  // Validating the timestamp clock separately from its saturated delta nibble.
-  uint16_t t0=MotionPipeline::tick_at(1000000),t1=MotionPipeline::tick_at(1030000); unsigned delta=(t1-t0)&4095;
-  std::printf("TICK 30ms: 12-bit advance=%u, 4-bit delta=%u\n",delta,std::min(delta,15u));
-  check(delta==24,"tick advances in real time",delta,24);
+  // Compatibility: v1.1.0 advances the 12-bit tick by exactly the emitted
+  // saturated 4-bit interval. Preserve that relationship across long gaps.
+  MotionClock clock;
+  auto elapsed = clock.advance(.030f);
+  unsigned delta=clock.tick;
+  check(elapsed==15 && delta==15,"30ms timestamp increment matches 4-bit field",delta,15);
+  clock.tick=4090;
+  elapsed=clock.advance(.020f);
+  check(elapsed==15 && clock.tick==9,"timestamp wraps consistently",clock.tick,9);
   // Golden bytes obtained independently from the unmodified encoder.
   const uint8_t golden[30]={0xBC,0xFA,0,0x0C,0,0xA8,0x17,0x15,0x03,0,0,0,0x01,0,0,0x80,0xCE,0x04,0xAF,0x01,0x64,0xF6,0xA1,0xFC,0x90,0xAD,0xFE,0x0F,0,0x02};
   const float quat[4]={.92387953f,.38268343f,0,0},acc[3]={.1f,-.2f,.95f}; uint8_t bytes[30]; Ns2MotionEncoder enc; enc.build(bytes,acc,0xABC,15,quat);

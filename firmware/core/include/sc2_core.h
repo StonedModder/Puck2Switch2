@@ -85,6 +85,9 @@ struct Sc2Input {
   uint16_t lt = 0, rt = 0; // 0..32767
   int16_t accel[3] = {0, 0, 0};
   int16_t gyro[3] = {0, 0, 0};
+  // Device IMU time is retained for diagnostics; current fusion is unchanged.
+  uint32_t imu_timestamp = 0;
+  uint8_t imu_report_id = 0;
   bool has_motion = false;
   bool valid = false;
 
@@ -128,6 +131,13 @@ inline bool parse_sc2(const uint8_t *r, size_t len, Sc2Input &out) {
 
   out.has_motion = (len >= SC2_MOTION_REPORT_LEN);
   if (out.has_motion) {
+    out.imu_report_id = r[0];
+    if (r[0] == SC2_REPORT_45) {
+      out.imu_timestamp = static_cast<uint32_t>(rd_u16(r, 30)) |
+                          (static_cast<uint32_t>(rd_u16(r, 32)) << 16);
+    } else {
+      out.imu_timestamp = rd_u16(r, 32);
+    }
     // RAW device axes, deliberately NOT remapped. The Switch 2 motion carrier
     // expects Nintendo's frame (Z out of the face). Measured on hardware, a
     // controller resting face-up reports gravity on raw Z (~16221 counts ~ 1 g),

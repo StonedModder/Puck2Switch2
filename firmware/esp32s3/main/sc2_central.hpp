@@ -15,13 +15,11 @@
 //      cross-checked against CouchTurtle/sc2-research (MIT) and SDL3.
 #pragma once
 
-// NimBLEScan accepts milliseconds, NOT raw 0.625-ms HCI units.
-// Fixed scan parameters avoid cancelling a scan merely to change its duty while
-// a link is active. 100 ms / 10 ms = 10%, leaving radio time for advertising
-// and the console link. Scan timing and real discovery latency require hardware.
+// Preserve v1.1.0's scanning parameters while testing the other changes.
+// NimBLEScan accepts milliseconds, not raw 0.625-ms HCI units.
 namespace s2s {
 struct ScanParams { unsigned interval_ms; unsigned window_ms; };
-constexpr ScanParams sc2_scan_params() { return {100, 10}; }
+constexpr ScanParams sc2_scan_params() { return {100, 80}; }
 constexpr unsigned ble_scan_units(unsigned ms) { return ms * 8u / 5u; }
 } // namespace s2s
 
@@ -49,7 +47,7 @@ public:
   bool begin();
   /// Drive connection state machine + lizard-off keepalive. Call from one task.
   void loop();
-  /// Compatibility shim: scanning uses a fixed low duty in every state.
+  /// Restore the v1.1.0 scan duty transitions.
   void set_scan_paused(bool paused);
 
   bool connected() const { return connected_.load(); }
@@ -130,6 +128,7 @@ private:
   void report_visible(int64_t now_us);
 
   std::atomic<bool> scan_started_{false};
+  std::atomic<bool> scan_paused_{false};
   bool imu_enabled_{false};
   int64_t last_keepalive_us_{0};
   uint32_t raw_dumps_{0};

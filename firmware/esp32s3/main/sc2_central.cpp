@@ -69,11 +69,18 @@ bool Sc2Central::begin() {
   return true;
 }
 
-void Sc2Central::set_scan_paused(bool /*paused*/) {
-  // Fixed low duty from begin(): do not cancel a running scan merely because a
-  // link changed state. NimBLEScan::stop() clears internal scan lists and has
-  // caused link teardown races. A scan is still cancelled to initiate the SC2
-  // connection in onResult() (existing behavior; see NimBLEClient::connect()).
+void Sc2Central::set_scan_paused(bool paused) {
+  if (scan_paused_.exchange(paused) == paused) return;
+  NimBLEScan *s = NimBLEDevice::getScan();
+  if (paused) {
+    s->setInterval(640);
+    s->setWindow(16);
+  } else {
+    s->setInterval(100);
+    s->setWindow(80);
+  }
+  if (scan_started_.exchange(false)) s->stop();
+  ESP_LOGI(TAG, "scan duty -> %s", paused ? "LOW ~2.5%" : "HIGH 80%");
 }
 
 void Sc2Central::start_scan() {
@@ -337,7 +344,7 @@ bool Sc2Central::try_connect(const NimBLEAddress &addr) {
 
   ESP_LOGI(TAG, "connecting to %s ...", addr.toString().c_str());
   if (!client_->connect(addr)) {
-    ESP_LOGW(TAG, "connect failed");
+    ESP_LOGW(TAG, "connect failed; NimBLE error=%d", client_->getLastError());
     return false;
   }
   connected_.store(true);

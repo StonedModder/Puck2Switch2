@@ -26,6 +26,7 @@
 #include "switch2_pro.hpp"
 
 #include "ns2_motion30.h"
+#include "motion_fusion.h"
 #include "macro_engine.hpp"
 #include "macro_store.hpp"
 #include "sc2_central.hpp"
@@ -51,10 +52,60 @@ static MacroEngine g_macro;
 // Live IMU: fuse the SC2's gyro+accel into an orientation quaternion and emit
 // the Switch 2's hardware-validated 30-byte motion carrier (report 0x0E = 0x1E).
 static constexpr bool kLiveMotion = true;
-static s2s::MahonyFilter g_attitude;
+static s2s::MotionPipeline g_motion;
+static s2s::MotionClock g_motion_clock;
 static s2s::Ns2MotionEncoder g_motion_enc;
-static uint16_t g_tick800 = 0;
 static int64_t g_last_imu_us = 0;
+
+// Diagnostic only: compare angular area using sensor time vs BLE arrival time.
+// Aggregated reporting avoids per-notification UART logging on the BLE task.
+static void log_imu_timing(const s2s::Sc2Input &in, int64_t now_us, float host_dt) {
+  static bool have_previous = false;
+  static uint8_t previous_id = 0;
+  static uint32_t previous_tick = 0, n = 0, duplicates = 0, invalid = 0;
+  static int64_t window_us = 0;
+  static uint64_t sensor_us_sum = 0, host_us_sum = 0;
+  static uint32_t host_gap_max_us = 0;
+  static float sensor_angle[3] = {}, host_angle[3] = {};
+  if (!window_us) window_us = now_us;
+  if (have_previous && previous_id == in.imu_report_id && host_dt > 0 && host_dt < .5f) {
+    uint32_t delta_us = in.imu_report_id == s2s::SC2_REPORT_45
+        ? in.imu_timestamp - previous_tick
+        : static_cast<uint16_t>(in.imu_timestamp - previous_tick) * 32u;
+    uint32_t host_us = static_cast<uint32_t>(host_dt * 1000000.0f);
+    if (host_us > host_gap_max_us) host_gap_max_us = host_us;
+    if (delta_us == 0) ++duplicates;
+    else if (delta_us > 500000) ++invalid;
+    else {
+      ++n;
+      sensor_us_sum += delta_us;
+      host_us_sum += host_us;
+      for (int i = 0; i < 3; ++i) {
+        const float corrected = in.gyro[i] / 16.3835f - g_motion.bias.bias[i];
+        sensor_angle[i] += corrected * (delta_us / 1000000.0f);
+        host_angle[i] += corrected * host_dt;
+      }
+    }
+  }
+  previous_id = in.imu_report_id;
+  previous_tick = in.imu_timestamp;
+  have_previous = true;
+  if (now_us - window_us >= 5000000) {
+    ESP_LOGI(TAG, "IMUDBG id=%02x n=%u dup=%u invalid=%u sensor_ms=%llu host_ms=%llu max_host_ms=%u "
+             "sensor_mdeg=%d,%d,%d host_mdeg=%d,%d,%d bias_mdps=%d,%d,%d bias_ready=%d",
+             in.imu_report_id, (unsigned)n, (unsigned)duplicates, (unsigned)invalid,
+             (unsigned long long)(sensor_us_sum/1000), (unsigned long long)(host_us_sum/1000),
+             (unsigned)(host_gap_max_us/1000),
+             (int)(sensor_angle[0]*1000), (int)(sensor_angle[1]*1000), (int)(sensor_angle[2]*1000),
+             (int)(host_angle[0]*1000), (int)(host_angle[1]*1000), (int)(host_angle[2]*1000),
+             (int)(g_motion.bias.bias[0]*1000), (int)(g_motion.bias.bias[1]*1000),
+             (int)(g_motion.bias.bias[2]*1000), (int)g_motion.bias.calibrated);
+    window_us = now_us;
+    n = duplicates = invalid = host_gap_max_us = 0;
+    sensor_us_sum = host_us_sum = 0;
+    for (int i = 0; i < 3; ++i) sensor_angle[i] = host_angle[i] = 0;
+  }
+}
 
 // Rebuild the Switch 2 report from one Steam Controller sample and hand it to
 // espp. Runs on the NimBLE host task so the report reflects the sample that just
@@ -82,16 +133,12 @@ static void push_from_sc2(const s2s::Sc2Input &in, const s2s::Sc2Battery &bat) {
                                 in.accel[2] / 16384.0f};
       const float gyro_dps[3] = {in.gyro[0] / 16.3835f, in.gyro[1] / 16.3835f,
                                  in.gyro[2] / 16.3835f};
-      g_attitude.update(gyro_dps, accel_g, dt);
+      g_motion.update(gyro_dps, accel_g, dt);
+      log_imu_timing(in, now_us, dt);
 
-      // The timing byte packs a 12-bit 800 Hz tick plus a 4-bit "ticks since the
-      // last report" nibble. A 20 ms gap needs 16, which cannot fit in 4 bits and
-      // corrupts the timestamp field, so clamp to the field width.
-      uint32_t ticks = (uint32_t)(dt * 800.0f + 0.5f);
-      if (ticks > 15u) ticks = 15u;
-      g_tick800 = (uint16_t)((g_tick800 + ticks) & 0x0FFFu);
-
-      g_motion_enc.build(carrier, accel_g, g_tick800, (uint8_t)ticks, g_attitude.q);
+      // Match the previously responsive v1.1.0 timestamp convention.
+      const uint8_t ticks = g_motion_clock.advance(dt);
+      g_motion_enc.build(carrier, accel_g, g_motion_clock.tick, ticks, g_motion.attitude.q);
       // 0x1E = 30-byte quaternion carrier (hardware-validated form).
       report.set_motion_block(carrier, s2s::NS2_MOTION30_LEN, 0x1E);
     }
@@ -268,6 +315,8 @@ extern "C" void app_main(void) {
   uint32_t prev_buttons = 0;
   uint32_t last_status_ms = 0;
   bool prev_sc2 = false;
+  int64_t wake_retry_until_us = 0;
+  int64_t next_wake_us = 0;
 
   while (true) {
     // Drive the SC2 central: connection state machine, lizard-off keepalive,
@@ -295,21 +344,25 @@ extern "C" void app_main(void) {
     prev_buttons = in.buttons;
 
     const bool sc2_up = sc2.connected();
+    const int64_t wake_now_us = esp_timer_get_time();
+    if ((sc2_up && !prev_sc2) || (sc2_up && new_presses)) {
+      // Only retry for a bounded period after an intentional controller action;
+      // never keep waking a console the user has deliberately put to sleep.
+      wake_retry_until_us = wake_now_us + 30000000;
+      next_wake_us = 0;
+    }
     if (sc2_up != prev_sc2) {
       ESP_LOGI(TAG, "SC2 %s (%u reports so far)", sc2_up ? "CONNECTED" : "disconnected",
                (unsigned)sc2.reports());
       prev_sc2 = sc2_up;
     }
-
-    // Any fresh button press on the Steam Controller wakes a sleeping console.
-    // wake_console() only succeeds once a console has actually completed pairing
-    // (it requires a persisted bond AND no active connection), so this is inert
-    // until the console has been paired at least once.
-    if (new_presses && !controller.is_connected()) {
+    if (controller.is_connected() || !sc2_up) {
+      wake_retry_until_us = 0;
+    } else if (controller.is_paired() && wake_now_us < wake_retry_until_us &&
+               wake_now_us >= next_wake_us) {
       const bool woke = controller.wake_console();
-      ESP_LOGI(TAG, "button 0x%08x -> wake %s (paired=%d)", (unsigned)new_presses,
-               woke ? "ADVERT SENT" : "not sent (no bond / already connected)",
-               (int)controller.is_paired());
+      next_wake_us = wake_now_us + 5000000;
+      ESP_LOGI(TAG, "bounded reconnect wake %s", woke ? "sent" : "not sent");
     }
 
     // The console asks "press L + R to select this controller" while connecting.

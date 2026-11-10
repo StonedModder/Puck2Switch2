@@ -1,5 +1,5 @@
 diff --git a/components/switch2_pro/include/switch2_pro.hpp b/components/switch2_pro/include/switch2_pro.hpp
-index f24f5f9..a038efb 100644
+index f24f5f91..a038efb0 100644
 --- a/components/switch2_pro/include/switch2_pro.hpp
 +++ b/components/switch2_pro/include/switch2_pro.hpp
 @@ -150,6 +150,17 @@ public:
@@ -33,10 +33,50 @@ index f24f5f9..a038efb 100644
                        const uint8_t *payload, size_t len);
    void handle_command(bool via_vibration_command, switch2::Command cmd, uint8_t transport,
 diff --git a/components/switch2_pro/include/switch2_pro_report.hpp b/components/switch2_pro/include/switch2_pro_report.hpp
-index 93ae2ed..88ced02 100644
+index 93ae2ed9..bcd52fde 100644
 --- a/components/switch2_pro/include/switch2_pro_report.hpp
 +++ b/components/switch2_pro/include/switch2_pro_report.hpp
-@@ -79,6 +79,16 @@ public:
+@@ -32,11 +32,27 @@ public:
+   static constexpr uint16_t STICK_CENTER = 0x800; ///< 12-bit midpoint (2048)
+   static constexpr uint16_t STICK_MAX = 0xfff;
+ 
++  /// Battery level field width: 0..9 bars (10..15 are reserved).
++  static constexpr uint8_t BATTERY_FULL = 9;
++  /// Level used until the application supplies a real reading.
++  ///
++  /// This MUST NOT be 0. Level 0 means *empty* on the wire, and the driver's
++  /// streaming task starts notifying the stored report the moment the console
++  /// subscribes — before the application has had a chance to call set_power().
++  /// A zero there may make the console believe the pad is dying. Whether it
++  /// caused a particular warning or disconnect requires a hardware test.
++  /// A genuine empty battery is still reportable, by calling set_power(0, ...)
++  /// explicitly once a real reading says 0.
++  static constexpr uint8_t DEFAULT_BATTERY_LEVEL = BATTERY_FULL;
++
+   Pro2InputReport() { reset(); }
+ 
+   void reset() {
+     data_.fill(0);
+     data_[0x0b] = 0x30; // "unknown" byte: 0x30 unless feature bit 5 is set (0x38)
++    // Never leave the power byte at the fill value: 0 encodes an EMPTY battery
++    // (see DEFAULT_BATTERY_LEVEL). Must come after the fill, never before.
++    set_power(DEFAULT_BATTERY_LEVEL, false, false);
+     set_left_stick(0.f, 0.f);
+     set_right_stick(0.f, 0.f);
+   }
+@@ -50,6 +66,11 @@ public:
+                                     (external_power ? 0x01 : 0x00));
+   }
+ 
++  /// Decode the power byte back out (0..9) for use by the other reports.
++  uint8_t battery_level() const { return static_cast<uint8_t>((data_[1] >> 2) & 0x0f); }
++  bool is_charging() const { return (data_[1] & 0x02) != 0; }
++  bool has_external_power() const { return (data_[1] & 0x01) != 0; }
++
+   // Face / shoulder / system buttons.
+   void set_a(bool v) { set_bit(2, 0x02, v); }
+   void set_b(bool v) { set_bit(2, 0x01, v); }
+@@ -79,6 +100,16 @@ public:
  
    const std::array<uint8_t, SIZE> &data() const { return data_; }
  
@@ -53,8 +93,125 @@ index 93ae2ed..88ced02 100644
  private:
    static uint16_t axis_to_u12(float v) {
      if (v < -1.f)
+@@ -106,4 +137,116 @@ private:
+   std::array<uint8_t, SIZE> data_{};
+ };
+ 
++// ---------------------------------------------------------------------------
++// Common input report (id 0x05, GATT handle 0x000a)
++// ---------------------------------------------------------------------------
++
++/// Map a 0..9 battery-level nibble to a plausible 1S Li-ion cell voltage in mV.
++///
++/// The Switch 2 controller protocol reports battery as a VOLTAGE on the common
++/// input report (offset 0x1f) and on command 0x0b/0x03, while the Pro
++/// Controller 2 input report (0x09) carries a coarse 0..9 nibble. The adapter
++/// only ever learns a percentage from the Steam Controller, so the voltage has
++/// to be synthesised from that nibble; a linear 3.30 V (empty) .. 4.20 V (full)
++/// ramp is used. The absolute curve is NOT from a capture (the one captured
++/// example, 0x0ea5 = 3749 mV, falls inside this range at roughly half charge),
++/// so treat the exact millivolts as an estimate — what matters is that it is
++/// never 0, which reads as a dead cell.
++inline uint16_t battery_level_to_mv(uint8_t level_0_9) {
++  if (level_0_9 > 9)
++    level_0_9 = 9;
++  return static_cast<uint16_t>(3300 + level_0_9 * 100); // 3300..4200 mV
++}
++
++/// Charge-status byte for the common input report / command 0x0b sub 0x04.
++/// 0x34 observed while charging over USB, 0x20 when fully charged. There is no
++/// capture for "running on battery, no charger", so 0x00 is used there.
++inline uint8_t charge_status_byte(bool charging, bool external_power) {
++  if (charging)
++    return 0x34;
++  if (external_power)
++    return 0x20;
++  return 0x00;
++}
++
++/// Size of input report 0x05 on BLE (report-id byte omitted), same as 0x09.
++inline constexpr size_t COMMON_INPUT_SIZE = 63;
++
++/// Build the common input report (0x05) that handle 0x000a exposes, deriving
++/// every field from a Pro Controller 2 report (0x09) so the two can never
++/// disagree.
++///
++/// Why this exists: handle 0x000a is created READ | NOTIFY, and until now it was
++/// never written at all — a GATT read returned an empty value with no voltage
++/// field. Whether the console reads it, or interprets an empty value as a low
++/// battery, is unknown. Layout per ndeadly/switch2_controller_research hid_reports.md
++/// "Input Report 0x05".
++///
++/// @param src      the Pro Controller 2 report currently being streamed
++/// @param counter  32-bit report counter (increments once per report)
++/// @param out      destination buffer, COMMON_INPUT_SIZE bytes
++inline void build_common_input_report(const Pro2InputReport &src, uint32_t counter,
++                                      std::array<uint8_t, COMMON_INPUT_SIZE> &out) {
++  out.fill(0);
++  const auto &d = src.data();
++
++  // 0x00..0x03 — 32-bit LE report counter.
++  out[0x00] = static_cast<uint8_t>(counter & 0xff);
++  out[0x01] = static_cast<uint8_t>((counter >> 8) & 0xff);
++  out[0x02] = static_cast<uint8_t>((counter >> 16) & 0xff);
++  out[0x03] = static_cast<uint8_t>((counter >> 24) & 0xff);
++
++  // 0x04..0x07 — buttons. Report 0x05 uses a DIFFERENT bit layout from 0x09,
++  // so this is an explicit remap, not a copy.
++  //   0x05 byte 0: 0x80 ZR 0x40 R 0x20 SL-R 0x10 SR-R 0x08 A 0x04 B 0x02 X 0x01 Y
++  //   0x05 byte 1: 0x40 C 0x20 Capture 0x10 Home 0x08 LStick 0x04 RStick 0x02 Plus 0x01 Minus
++  //   0x05 byte 2: 0x80 ZL 0x40 L 0x20 SL-L 0x10 SR-L 0x08 Left 0x04 Right 0x02 Up 0x01 Down
++  //   0x05 byte 3: 0x10 Headset 0x02 GL 0x01 GR
++  const uint8_t b2 = d[2], b3 = d[3], b4 = d[4];
++  uint8_t o0 = 0, o1 = 0, o2 = 0, o3 = 0;
++  if (b2 & 0x20) o0 |= 0x80; // ZR
++  if (b2 & 0x10) o0 |= 0x40; // R
++  if (b2 & 0x02) o0 |= 0x08; // A
++  if (b2 & 0x01) o0 |= 0x04; // B
++  if (b2 & 0x08) o0 |= 0x02; // X
++  if (b2 & 0x04) o0 |= 0x01; // Y
++  if (b4 & 0x10) o1 |= 0x40; // C
++  if (b4 & 0x02) o1 |= 0x20; // Capture
++  if (b4 & 0x01) o1 |= 0x10; // Home
++  if (b3 & 0x80) o1 |= 0x08; // left stick click
++  if (b2 & 0x80) o1 |= 0x04; // right stick click
++  if (b2 & 0x40) o1 |= 0x02; // Plus
++  if (b3 & 0x40) o1 |= 0x01; // Minus
++  if (b3 & 0x20) o2 |= 0x80; // ZL
++  if (b3 & 0x10) o2 |= 0x40; // L
++  if (b3 & 0x04) o2 |= 0x08; // Left
++  if (b3 & 0x02) o2 |= 0x04; // Right
++  if (b3 & 0x08) o2 |= 0x02; // Up
++  if (b3 & 0x01) o2 |= 0x01; // Down
++  if (b4 & 0x08) o3 |= 0x02; // GL
++  if (b4 & 0x04) o3 |= 0x01; // GR
++  out[0x04] = o0;
++  out[0x05] = o1;
++  out[0x06] = o2;
++  out[0x07] = o3;
++
++  // 0x0a..0x0f — sticks. Both reports pack two 12-bit axes into 3 bytes the
++  // same way, so the 0x09 bytes carry over unchanged.
++  out[0x0a] = d[5];
++  out[0x0b] = d[6];
++  out[0x0c] = d[7];
++  out[0x0d] = d[8];
++  out[0x0e] = d[9];
++  out[0x0f] = d[10];
++
++  // 0x1f..0x21 — estimated voltage and charge state derived from report 0x09.
++  const uint16_t mv = battery_level_to_mv(src.battery_level());
++  out[0x1f] = static_cast<uint8_t>(mv & 0xff);
++  out[0x20] = static_cast<uint8_t>(mv >> 8);
++  out[0x21] = charge_status_byte(src.is_charging(), src.has_external_power());
++
++  // 0x29 — documented as always 0x01 on a real controller.
++  out[0x29] = 0x01;
++}
++
+ } // namespace espp::switch2
 diff --git a/components/switch2_pro/src/switch2_pro.cpp b/components/switch2_pro/src/switch2_pro.cpp
-index f0ae672..27fe91d 100644
+index f0ae6721..38741dc5 100644
 --- a/components/switch2_pro/src/switch2_pro.cpp
 +++ b/components/switch2_pro/src/switch2_pro.cpp
 @@ -57,6 +57,8 @@ public:
@@ -79,7 +236,18 @@ index f0ae672..27fe91d 100644
      size_t cleared = ble_gatt_server_.unpair_all().size();
      if (cleared)
        logger_.info("cleared {} stale BLE bond(s)", cleared);
-@@ -449,7 +455,7 @@ bool Switch2Pro::build_gatt() {
+@@ -444,12 +450,18 @@ bool Switch2Pro::build_gatt() {
+                                              NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+   attach(common_input_, "common_input(0x000a)", 0);
+   add_desc(common_input_, REPORT_RATE_DESC_UUID);
++  // Seed the READ value before any subscription or input sample arrives.
++  {
++    std::array<uint8_t, switch2::COMMON_INPUT_SIZE> common{};
++    switch2::build_common_input_report(input_report_, 0, common);
++    common_input_->setValue(common.data(), common.size());
++  }
+   pro2_input_ = svc2->createCharacteristic(NimBLEUUID(PRO2_INPUT_UUID),
+                                            NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
    attach(pro2_input_, "pro2_input(0x000e)", 0);
    add_desc(pro2_input_, REPORT_RATE_DESC_UUID);
    attach(svc2->createCharacteristic(NimBLEUUID(VIBRATION_UUID), NIMBLE_PROPERTY::WRITE_NR),
@@ -88,7 +256,17 @@ index f0ae672..27fe91d 100644
    command_ = svc2->createCharacteristic(NimBLEUUID(COMMAND_UUID), NIMBLE_PROPERTY::WRITE_NR);
    attach(command_, "command(0x0014)", 1);
    vibration_command_ =
-@@ -707,18 +713,45 @@ void Switch2Pro::send_ack(bool via_vibration_command, uint8_t cmd, uint8_t trans
+@@ -547,6 +559,9 @@ bool Switch2Pro::start_advertising(AdvMode mode, const std::array<uint8_t, 6> &h
+   BleGattServer::AdvertisingParameters params{};
+   params.connectable = true;
+   params.scan_response = true;
++  // Explicitly narrow the legacy advertising range from the 20–40 ms default.
++  params.min_interval_ms = 20; // 32 * 0.625 ms
++  params.max_interval_ms = 30; // 48 * 0.625 ms
+   const char *mode_name = mode == AdvMode::Discovery   ? "discovery"
+                           : mode == AdvMode::Reconnect ? "reconnect"
+                                                        : "wake";
+@@ -707,18 +722,45 @@ void Switch2Pro::send_ack(bool via_vibration_command, uint8_t cmd, uint8_t trans
  // Command dispatch
  // ---------------------------------------------------------------------------
  
@@ -137,7 +315,41 @@ index f0ae672..27fe91d 100644
    }
    if (len < COMMAND_HEADER_SIZE) {
      logger_.warn("short command write ({} bytes)", len);
-@@ -998,7 +1031,9 @@ bool Switch2Pro::send_input_report(
+@@ -949,6 +991,33 @@ bool Switch2Pro::input_stream_tick(std::mutex &m, std::condition_variable &cv) {
+       snap = input_report_.data();
+     }
+ 
++    // Keep the common input report (0x05, handle 0x000a) in step with what we
++    // stream. That characteristic is READ | NOTIFY but was never written, so a
++    // GATT read returned an empty value, with no battery voltage at offset
++    // 0x1f. Whether the console reads this characteristic is unverified. We
++    // only update the cached value (no notify()), so the console's
++    // chosen report format and the GATT layout are unchanged.
++    //
++    // Refreshed at ~5 Hz: this is metadata the console reads occasionally, not
++    // a stream, and it must not compete with the input notify for mbufs. The
++    // throttle lives in a function-local static because there is one streaming
++    // task per instance and this only gates the rate.
++    if (common_input_ != nullptr) {
++      static int64_t last_common_refresh_us = 0;
++      if (t_us - last_common_refresh_us >= 200000 || last_common_refresh_us == 0) {
++        last_common_refresh_us = t_us;
++        static uint32_t common_counter = 0;
++        switch2::Pro2InputReport src;
++        {
++          std::lock_guard<std::mutex> lk(input_mutex_);
++          src = input_report_;
++        }
++        std::array<uint8_t, switch2::COMMON_INPUT_SIZE> common{};
++        switch2::build_common_input_report(src, common_counter++, common);
++        common_input_->setValue(common.data(), common.size());
++      }
++    }
++
+     bool should_send = true;
+     if (continuous_streaming_enabled_) {
+       // Rate-halving probe: send only every Nth interval (N=1 → every interval).
+@@ -998,7 +1067,9 @@ bool Switch2Pro::send_input_report(
    // of being hardcoded, so the flags always match the negotiated mask.
    buf[0x0b] = (enabled_features_ & switch2::FEATURE_RUMBLE) ? 0x38 : 0x30;
    if (enabled_features_ & switch2::FEATURE_IMU) {
@@ -148,3 +360,73 @@ index f0ae672..27fe91d 100644
      if (imu_motion_enabled_) {
        // Replay captured resting-motion frames. NOTE: the sequence loops (128
        // frames ≈ 2 s at 62 Hz), so its embedded timestamps jump backwards at the
+@@ -1487,13 +1558,67 @@ void Switch2Pro::handle_command(bool via_vibration_command, Command cmd, uint8_t
+       send_ack(via_vibration_command, static_cast<uint8_t>(cmd), transport, sub);
+     }
+     break;
++  case Command::BATTERY: {
++    // Command 0x0b (battery). Previously these requests received only a bare
++    // ACK. Whether that causes the console's warning remains unverified.
++    //
++    // Payload shapes are from the community reverse-engineering effort
++    // (ndeadly/switch2_controller_research, commands.md "Command 0x0B -
++    // Battery"), confirmed against its captured examples:
++    //   0x03 get battery voltage -> [voltage_mv u16 LE, 0x0000]   e.g. a5 0e 00 00
++    //   0x04 get charge status   -> [charge_status u16 LE, flags u16 LE]  e.g. 34 00 83 00
++    //   0x06 unknown             -> 11 00 00 00 (constant)
++    // Everything is sourced from the SAME power byte the input report streams,
++    // so the two answers can never disagree.
++    uint8_t power = 0;
++    {
++      std::lock_guard<std::mutex> lk(input_mutex_);
++      power = input_report_.data()[1];
++    }
++    const uint8_t level = static_cast<uint8_t>((power >> 2) & 0x0f);
++    const bool charging = (power & 0x02) != 0;
++    const bool external = (power & 0x01) != 0;
++    switch (sub) {
++    case 0x03: {
++      const uint16_t mv = switch2::battery_level_to_mv(level);
++      const std::array<uint8_t, 4> d = {static_cast<uint8_t>(mv & 0xff),
++                                        static_cast<uint8_t>(mv >> 8), 0x00, 0x00};
++      send_response(via_vibration_command, static_cast<uint8_t>(cmd), transport, sub, RSP_BYTE4_BT,
++                    RSP_BYTE5_BT, d.data(), d.size());
++      break;
++    }
++    case 0x04: {
++      // Charge status: 0x34 observed while charging from USB, 0x20 when fully
++      // charged. No capture exists for "on battery, no charger", so 0x00 is used
++      // — the honest "not charging" value for a wireless pad. The trailing
++      // 0x0083 is the flags word from the one captured example.
++      const uint16_t status = switch2::charge_status_byte(charging, external);
++      const std::array<uint8_t, 4> d = {static_cast<uint8_t>(status & 0xff),
++                                        static_cast<uint8_t>(status >> 8), 0x83, 0x00};
++      send_response(via_vibration_command, static_cast<uint8_t>(cmd), transport, sub, RSP_BYTE4_BT,
++                    RSP_BYTE5_BT, d.data(), d.size());
++      break;
++    }
++    case 0x06: {
++      static constexpr std::array<uint8_t, 4> d = {0x11, 0x00, 0x00, 0x00};
++      send_response(via_vibration_command, static_cast<uint8_t>(cmd), transport, sub, RSP_BYTE4_BT,
++                    RSP_BYTE5_BT, d.data(), d.size());
++      break;
++    }
++    default:
++      // 0x07 and anything else: no response payload is documented. ACK so the
++      // console's state machine still advances.
++      send_ack(via_vibration_command, static_cast<uint8_t>(cmd), transport, sub);
++      break;
++    }
++    break;
++  }
+   case Command::INIT:
+   case Command::PLAYER_LEDS:
+   case Command::VIBRATION:
+-  case Command::BATTERY:
+   default:
+     // Acknowledge so the console's init state machine advances. Command-specific
+-    // payloads (battery level, etc.) are refined in later work.
++    // payloads for these are refined in later work.
+     send_ack(via_vibration_command, static_cast<uint8_t>(cmd), transport, sub);
+     break;
+   }

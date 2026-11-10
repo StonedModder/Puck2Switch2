@@ -39,6 +39,18 @@ struct GyroBiasEstimator {
   }
 };
 
+// Preserve the v1.1.0 carrier clock: its 12-bit tick and 4-bit interval
+// advance together, even if a source report is delayed beyond 15 ticks.
+struct MotionClock {
+  uint16_t tick = 0;
+  uint8_t advance(float dt) {
+    uint32_t ticks = static_cast<uint32_t>(dt * 800.0f + 0.5f);
+    if (ticks > 15u) ticks = 15u;
+    tick = static_cast<uint16_t>((tick + ticks) & 0x0fffu);
+    return static_cast<uint8_t>(ticks);
+  }
+};
+
 struct MotionPipeline {
   MahonyFilter attitude;
   GyroBiasEstimator bias;
