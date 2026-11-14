@@ -13,7 +13,9 @@
 // r[0] == report id, matching joypad-os's "assembled report" convention.
 #pragma once
 
+#include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -64,9 +66,13 @@ static constexpr int SC2_OFF_BUTTONS = 2;
 static constexpr int SC2_OFF_LTRIGGER = 6;
 static constexpr int SC2_OFF_RTRIGGER = 8;
 static constexpr int SC2_OFF_LX = 10;
-static constexpr int SC2_OFF_LY = 12; // +up  (must invert for HID/Switch up=+)
+static constexpr int SC2_OFF_LY = 12; // +up
 static constexpr int SC2_OFF_RX = 14;
 static constexpr int SC2_OFF_RY = 16; // +up
+static constexpr int SC2_OFF_LPAD_X = 18;
+static constexpr int SC2_OFF_LPAD_Y = 20;
+static constexpr int SC2_OFF_RPAD_X = 24;
+static constexpr int SC2_OFF_RPAD_Y = 26;
 static constexpr int SC2_OFF_ACCEL = 34;
 static constexpr int SC2_OFF_GYRO = 40;
 static constexpr int SC2_MIN_REPORT_LEN = 18;    // buttons + sticks
@@ -79,10 +85,16 @@ static constexpr uint8_t SC2_REPORT_47 = 0x47; // TritonMTUNoQuat32TS ("Ibex")
 // Normalized SC2 state (raw, as decoded from the wire)
 // ---------------------------------------------------------------------------
 struct Sc2Input {
+  struct Touchpad {
+    int16_t x = 0, y = 0; // +Y is up
+    bool touched = false;
+  };
+
   uint32_t buttons = 0;   // bitfield of Sc2Button
   int16_t lx = 0, ly = 0; // -32768..32767, ly +up
   int16_t rx = 0, ry = 0; // ry +up
   uint16_t lt = 0, rt = 0; // 0..32767
+  Touchpad left_pad, right_pad;
   int16_t accel[3] = {0, 0, 0};
   int16_t gyro[3] = {0, 0, 0};
   // Device IMU time is retained for diagnostics; current fusion is unchanged.
@@ -128,6 +140,17 @@ inline bool parse_sc2(const uint8_t *r, size_t len, Sc2Input &out) {
   out.ly = rd_s16(r, SC2_OFF_LY);
   out.rx = rd_s16(r, SC2_OFF_RX);
   out.ry = rd_s16(r, SC2_OFF_RY);
+
+  // 0x47 inserts a two-byte trackpad timestamp before both pad coordinates.
+  const int pad_shift = r[0] == SC2_REPORT_47 ? 2 : 0;
+  out.left_pad = {};
+  out.right_pad = {};
+  if (len >= static_cast<size_t>(SC2_OFF_RPAD_Y + pad_shift + 2)) {
+    out.left_pad = {rd_s16(r, SC2_OFF_LPAD_X + pad_shift),
+                    rd_s16(r, SC2_OFF_LPAD_Y + pad_shift), out.pressed(SC2_LPAD_TOUCH)};
+    out.right_pad = {rd_s16(r, SC2_OFF_RPAD_X + pad_shift),
+                     rd_s16(r, SC2_OFF_RPAD_Y + pad_shift), out.pressed(SC2_RPAD_TOUCH)};
+  }
 
   out.has_motion = (len >= SC2_MOTION_REPORT_LEN);
   if (out.has_motion) {
@@ -235,6 +258,7 @@ struct MapConfig {
   int face_label_mode = 0;
   // Stick deadzone in normalized units (SC2 idles with a small bias ~±300).
   float deadzone = 0.06f;
+  bool swap_ab = false;
 };
 
 // Normalized stick: -1..+1 with +Y = up (identical convention both sides).
@@ -245,6 +269,47 @@ inline float norm_stick(int16_t v, float deadzone) {
   if (f > -deadzone && f < deadzone) f = 0.0f;
   return f;
 }
+
+struct StickAxes {
+  float x, y;
+};
+
+inline StickAxes map_stick(int16_t x, int16_t y, const Sc2Input::Touchpad &pad, float deadzone) {
+  const StickAxes physical{norm_stick(x, deadzone), norm_stick(y, deadzone)};
+  if (!pad.touched || physical.x != 0.f || physical.y != 0.f) return physical;
+  return {norm_stick(pad.x, deadzone), norm_stick(pad.y, deadzone)};
+}
+
+class RelativeTouchpad {
+public:
+  Sc2Input::Touchpad update(Sc2Input::Touchpad pad, int64_t now_us) {
+    const auto previous = previous_;
+    const auto elapsed = now_us - last_sample_us_;
+    previous_ = pad;
+    last_sample_us_ = now_us;
+
+    // Start a fresh gesture after a release or a gap in Bluetooth reports.
+    if (!pad.touched || !previous.touched || elapsed <= 0 || elapsed > 100000) return {};
+
+    const int dx = int(pad.x) - previous.x;
+    const int dy = int(pad.y) - previous.y;
+    if (dx * int64_t(dx) + dy * int64_t(dy) < 24 * 24) return {};
+
+    // Express finger speed as a stick deflection. The minimum output is radial
+    // so small diagonals keep their direction when crossing the game's dead zone.
+    const float distance = std::sqrt(float(dx) * dx + float(dy) * dy);
+    constexpr float full_speed = 500000.f; // pad counts per second
+    constexpr float minimum_output = 0.15f;
+    const float speed = distance * 1000000.f / float(elapsed);
+    const float output = minimum_output + (1.f - minimum_output) * std::min(speed / full_speed, 1.f);
+    const float scale = 32767.f * output / distance;
+    return {static_cast<int16_t>(dx * scale), static_cast<int16_t>(dy * scale), true};
+  }
+
+private:
+  Sc2Input::Touchpad previous_;
+  int64_t last_sample_us_ = 0;
+};
 
 // 12-bit axis encoding, identical to espp's Pro2InputReport::axis_to_u12():
 //   u12 = (clamp(v,-1,1) * 0.5 + 0.5) * 4095, rounded.
@@ -301,8 +366,8 @@ inline void map_sc2_to_sw2(const Sc2Input &in, const Sc2Battery &bat, const MapC
   bool sw_a, sw_b, sw_x, sw_y;
   if (cfg.face_label_mode == 0) {
     // position: south->B(offset2 0x01), east->A(0x02), west->Y(0x04), north->X(0x08)
-    sw_b = south;
-    sw_a = east;
+    sw_b = cfg.swap_ab ? east : south;
+    sw_a = cfg.swap_ab ? south : east;
     sw_y = west;
     sw_x = north;
   } else {
@@ -345,12 +410,10 @@ inline void map_sc2_to_sw2(const Sc2Input &in, const Sc2Battery &bat, const MapC
   // L5/R5 (lower paddles) have no Switch 2 equivalent: unmapped by default.
 
   // ---- sticks -------------------------------------------------------------
-  const float lx = norm_stick(in.lx, cfg.deadzone);
-  const float ly = norm_stick(in.ly, cfg.deadzone); // +up -> +up (no invert needed)
-  const float rx = norm_stick(in.rx, cfg.deadzone);
-  const float ry = norm_stick(in.ry, cfg.deadzone); // +up -> +up
-  pack_stick(out + 5, axis_to_u12(lx), axis_to_u12(ly));
-  pack_stick(out + 8, axis_to_u12(rx), axis_to_u12(ry));
+  const auto left = map_stick(in.lx, in.ly, in.left_pad, cfg.deadzone);
+  const auto right = map_stick(in.rx, in.ry, in.right_pad, cfg.deadzone);
+  pack_stick(out + 5, axis_to_u12(left.x), axis_to_u12(left.y));
+  pack_stick(out + 8, axis_to_u12(right.x), axis_to_u12(right.y));
 
   // ---- power --------------------------------------------------------------
   // SC2 reports 0..100%; Switch 2 wants 0..9. Until the first real battery

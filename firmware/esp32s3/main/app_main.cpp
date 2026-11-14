@@ -45,7 +45,7 @@ static std::atomic<int64_t> g_in_ts_us{0}; // arrival time of the newest SC2 sam
 // --- report pipeline (NimBLE host task) -------------------------------------
 static espp::Switch2Pro *g_ctl = nullptr;
 static Sc2Central *g_sc2 = nullptr;
-static s2s::MapConfig g_cfg{};
+static constexpr s2s::MapConfig g_cfg{.swap_ab = true};
 static std::atomic<bool> g_hold_lr{false}; // console is asking "press L + R"
 static MacroEngine g_macro;
 
@@ -110,10 +110,12 @@ static void log_imu_timing(const s2s::Sc2Input &in, int64_t now_us, float host_d
 // Rebuild the Switch 2 report from one Steam Controller sample and hand it to
 // espp. Runs on the NimBLE host task so the report reflects the sample that just
 // arrived rather than the last one a polling loop happened to see.
-static void push_from_sc2(const s2s::Sc2Input &in, const s2s::Sc2Battery &bat) {
+static void push_from_sc2(s2s::Sc2Input in, const s2s::Sc2Battery &bat, int64_t now_us) {
   static espp::switch2::Pro2InputReport report;
   static uint8_t carrier[s2s::NS2_MOTION30_LEN];
+  static s2s::RelativeTouchpad right_pad;
 
+  in.right_pad = right_pad.update(in.right_pad, now_us);
   report.reset();
   s2s::apply_sc2_to_pro2(in, bat, g_cfg, report);
 
@@ -123,7 +125,6 @@ static void push_from_sc2(const s2s::Sc2Input &in, const s2s::Sc2Battery &bat) {
   }
 
   if (kLiveMotion && in.has_motion) {
-    const int64_t now_us = esp_timer_get_time();
     float dt = (float)(now_us - g_last_imu_us) * 1e-6f;
     g_last_imu_us = now_us;
     if (dt > 0.0005f && dt < 0.5f) {
@@ -248,14 +249,15 @@ extern "C" void app_main(void) {
   static Sc2Central sc2;
   g_sc2 = &sc2;
   sc2.set_input_cb([](const s2s::Sc2Input &in) {
+    const int64_t now_us = esp_timer_get_time();
     s2s::Sc2Battery bat;
     {
       std::lock_guard<std::mutex> lk(g_mtx);
       g_in = in;
-      g_in_ts_us.store(esp_timer_get_time());
+      g_in_ts_us.store(now_us);
       bat = g_bat;
     }
-    push_from_sc2(in, bat); // forward immediately, do not wait for the loop
+    push_from_sc2(in, bat, now_us); // forward immediately, do not wait for the loop
   });
   sc2.set_battery_cb([](const s2s::Sc2Battery &b) {
     std::lock_guard<std::mutex> lk(g_mtx);
