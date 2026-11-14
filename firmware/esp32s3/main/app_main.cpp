@@ -45,7 +45,7 @@ static std::atomic<int64_t> g_in_ts_us{0}; // arrival time of the newest SC2 sam
 // --- report pipeline (NimBLE host task) -------------------------------------
 static espp::Switch2Pro *g_ctl = nullptr;
 static Sc2Central *g_sc2 = nullptr;
-static constexpr s2s::MapConfig g_cfg{.swap_ab = true};
+static constexpr s2s::MapConfig g_cfg{.face_label_mode = 1};
 static std::atomic<bool> g_hold_lr{false}; // console is asking "press L + R"
 static MacroEngine g_macro;
 
