@@ -217,9 +217,18 @@ bool Sc2Central::setup_gatt() {
     return false;
   }
 
-  // Only ONE of the two input characteristics exists on a given unit.
-  NimBLERemoteCharacteristic *in45 = svc->getCharacteristic(NimBLEUUID(std::string(VALVE_IN45)));
-  NimBLERemoteCharacteristic *in47 = svc->getCharacteristic(NimBLEUUID(std::string(VALVE_IN47)));
+  // Enumerate once. Individual UUID lookups can stall when an optional
+  // characteristic is absent on this controller firmware.
+  const auto &chars = svc->getCharacteristics(/*refresh=*/true);
+  const auto find = [&chars](const char *id) -> NimBLERemoteCharacteristic * {
+    const NimBLEUUID uuid(id);
+    for (auto *ch : chars) {
+      if (ch->getUUID() == uuid) return ch;
+    }
+    return nullptr;
+  };
+  NimBLERemoteCharacteristic *in45 = find(VALVE_IN45);
+  NimBLERemoteCharacteristic *in47 = find(VALVE_IN47);
   NimBLERemoteCharacteristic *in_chr = in45 ? in45 : in47;
   const uint8_t report_id = in45 ? 0x45 : 0x47;
   if (!in_chr) {
@@ -242,40 +251,14 @@ bool Sc2Central::setup_gatt() {
     ESP_LOGE(TAG, "subscribe failed on report 0x%02X characteristic", report_id);
     return false;
   }
+  if (!client_->isConnected()) return false;
   ESP_LOGI(TAG, "subscribed to report 0x%02X notifications", report_id);
 
-  feat_chr_ = svc->getCharacteristic(NimBLEUUID(std::string(VALVE_FEAT)));
-  if (!feat_chr_) {
-    // Without this characteristic the lizard-off keepalive cannot be sent and the
-    // controller falls back to lizard mode ~3 s in (which looks like a dead pad).
-    // After a re-pair the service can be re-enumerated under a new instance, so
-    // search the whole GATT tree by UUID before giving up.
-    for (auto *s : client_->getServices(/*refresh=*/true)) {
-      if (!s) continue;
-      auto *c = s->getCharacteristic(NimBLEUUID(std::string(VALVE_FEAT)));
-      if (c) {
-        feat_chr_ = c;
-        ESP_LOGW(TAG, "feature characteristic found via fallback scan (handle 0x%04x)",
-                 c->getHandle());
-        break;
-      }
-    }
-    if (!feat_chr_) ESP_LOGE(TAG, "feature characteristic missing — lizard-off unavailable");
-  }
+  feat_chr_ = find(VALVE_FEAT);
+  if (!feat_chr_) ESP_LOGE(TAG, "feature characteristic missing — lizard-off unavailable");
+  send_keepalive(/*include_imu=*/true);
 
-  // Haptic output (rumble). Same fallback treatment: after a re-pair the service
-  // can come back under a new instance, so search the tree by UUID.
-  rumble_chr_ = svc->getCharacteristic(NimBLEUUID(std::string(VALVE_RUMBLE)));
-  if (!rumble_chr_) {
-    for (auto *s : client_->getServices(/*refresh=*/true)) {
-      if (!s) continue;
-      auto *c = s->getCharacteristic(NimBLEUUID(std::string(VALVE_RUMBLE)));
-      if (c) {
-        rumble_chr_ = c;
-        break;
-      }
-    }
-  }
+  rumble_chr_ = find(VALVE_RUMBLE);
   if (rumble_chr_) {
     // A write that returns true only means "queued", not "delivered", so record
     // what the characteristic actually advertises — if the pad stays silent this
@@ -287,7 +270,7 @@ bool Sc2Central::setup_gatt() {
     ESP_LOGE(TAG, "haptic characteristic missing — rumble unavailable");
   }
 
-  NimBLERemoteCharacteristic *batt = svc->getCharacteristic(NimBLEUUID(std::string(VALVE_BATT)));
+  NimBLERemoteCharacteristic *batt = find(VALVE_BATT);
   if (batt) {
     batt->subscribe(true, [this](NimBLERemoteCharacteristic *, uint8_t *d, size_t len, bool) {
       if (len < 2) return;
@@ -300,7 +283,23 @@ bool Sc2Central::setup_gatt() {
       if (battery_cb_) battery_cb_(b);
     });
   }
-  return true;
+
+  // Subscribing to HID input reports wakes the pads. Their coordinates arrive
+  // in the Valve input notification already handled above.
+  if (!client_->isConnected()) return false;
+  if (auto *hid = client_->getService(NimBLEUUID(uint16_t{0x1812}))) {
+    const NimBLEUUID report_uuid(uint16_t{0x2a4d});
+    const NimBLEUUID subscription_uuid(uint16_t{0x2902});
+    unsigned subscribed = 0;
+    for (auto *report : hid->getCharacteristics(/*refresh=*/true)) {
+      if (report->getUUID() == report_uuid && report->canNotify() &&
+          report->getDescriptor(subscription_uuid) && report->subscribe()) {
+        ++subscribed;
+      }
+    }
+    ESP_LOGI(TAG, "HID input subscriptions for touchpads: %u", subscribed);
+  }
+  return client_->isConnected();
 }
 
 void Sc2Central::handle_notification(uint8_t report_id, const uint8_t *data, size_t len) {

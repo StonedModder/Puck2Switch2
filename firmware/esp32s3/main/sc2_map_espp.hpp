@@ -36,8 +36,8 @@ inline void apply_sc2_to_pro2(const Sc2Input &in, const Sc2Battery &bat, const M
 
   if (cfg.face_label_mode == 0) {
     // position-based: SC2 south->Switch B, east->A, west->Y, north->X
-    ref.set_b(south);
-    ref.set_a(east);
+    ref.set_b(cfg.swap_ab ? east : south);
+    ref.set_a(cfg.swap_ab ? south : east);
     ref.set_y(west);
     ref.set_x(north);
   } else {
@@ -72,8 +72,10 @@ inline void apply_sc2_to_pro2(const Sc2Input &in, const Sc2Battery &bat, const M
   ref.set_gr(in.pressed(SC2_R4));
   // L5/R5 lower paddles: no Switch 2 equivalent, unmapped.
 
-  ref.set_left_stick(norm_stick(in.lx, cfg.deadzone), norm_stick(in.ly, cfg.deadzone));
-  ref.set_right_stick(norm_stick(in.rx, cfg.deadzone), norm_stick(in.ry, cfg.deadzone));
+  const auto left = map_stick(in.lx, in.ly, in.left_pad, cfg.deadzone);
+  const auto right = map_stick(in.rx, in.ry, in.right_pad, cfg.deadzone);
+  ref.set_left_stick(left.x, left.y);
+  ref.set_right_stick(right.x, right.y);
 
   // Battery: 0..9 bars. Never report 0 while the level is merely UNKNOWN — until
   // the first notification arrives bat.valid is false, and advertising an empty
